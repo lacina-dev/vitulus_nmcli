@@ -1,0 +1,320 @@
+#!/usr/bin/env python
+import rospy
+import time
+from std_msgs.msg import Bool, String, Empty
+from vitulus_msgs.msg import NmConn, NmSsid, NmSsidList, NmConnDetail, NmConnAdd
+import sys
+import signal
+import NetworkManager
+import os
+import uuid
+import subprocess
+from dbus.mainloop.glib import DBusGMainLoop
+DBusGMainLoop(set_as_default=True)
+
+c = NetworkManager.const
+
+class NmcliNode:
+
+    def __init__(self):
+        self.pub_nm_conn_list = rospy.Publisher('conn_list', NmConn, queue_size=10)
+        self.pub_nm_conn_detail = rospy.Publisher('conn_detail', NmConnDetail, queue_size=10)
+        self.pub_nm_ssid_list = rospy.Publisher('ssid_list', NmSsidList, queue_size=10)
+        self.sub_nm_disconnect_wifi = rospy.Subscriber("disconnect_wifi", Bool, self.callback_disconnect_wifi)
+        self.sub_nm_scan_ap = rospy.Subscriber("scan_ap", Bool, self.callback_scan_ap)
+        self.sub_nm_conn_activate = rospy.Subscriber("conn_activate", String, self.callback_conn_activate)
+        self.sub_nm_conn_add = rospy.Subscriber("conn_add", NmConnAdd, self.callback_conn_add)
+        self.sub_nm_conn_del = rospy.Subscriber("conn_del", String, self.callback_conn_del)
+
+        self.ssid_scan_list = NmSsidList()
+        self.callback_scan_ap(Bool())
+
+
+    def publish_nm_conn_list(self):
+        msg = NmConn()
+        msg.connections = self.list_connections()
+        msg.header.stamp = rospy.Time.now()
+        self.pub_nm_conn_list.publish(msg)
+
+    def publish_nm_conn_detail(self):
+        msg = NmConnDetail()
+        msg.status = 'Disconnected'
+        for conn in NetworkManager.NetworkManager.ActiveConnections:
+            if conn.Connection.GetSettings()['connection']['type'] == '802-11-wireless':
+                settings = conn.Connection.GetSettings()
+
+                for s in list(settings.keys()):
+                    if 'data' in settings[s]:
+                        settings[s + '-data'] = settings[s].pop('data')
+
+                secrets = conn.Connection.GetSecrets()
+                for key in secrets:
+                    settings[key].update(secrets[key])
+
+                devices = ""
+                if conn.Devices:
+                    devices = "%s" % ", ".join([x.Interface for x in conn.Devices])
+                msg.connection = "{}".format(settings['connection']['id'])
+                msg.device = "{}".format(devices)
+                for key, val in sorted(settings.items()):
+                    if key != 'ipv6':
+                        for name, value in val.items():
+                            if name == "ssid":
+                                msg.ssid = "{}".format(value)
+                            if name == "mode":
+                                msg.mode = "{}".format(value)
+                            if name == "mac-address":
+                                msg.mac_address = "{}".format(value)
+                            if name == "key-mgmt":
+                                msg.key_mgmt = "{}".format(value)
+                            if name == "psk":
+                                msg.psk = "{}".format(value)
+                            if name == "method":
+                                msg.method = "{}".format(value)
+                for dev in conn.Devices:
+                    try:
+                        for addr in dev.Ip4Config.Addresses:
+                            msg.addresses.append("{}/{} gw {}".format(addr[0], addr[1], addr[2]))
+                            msg.status = 'Connected'
+                        for route in dev.Ip4Config.Routes:
+                            msg.routes.append("{}/{} gw {}".format(route[0], route[1], route[2]))
+                        for ns in dev.Ip4Config.Nameservers:
+                            msg.dns.append("{}".format(ns))
+                    except:
+                        pass
+                for ap in self.ssid_scan_list.ssid_list:
+                    if (ap.ssid == msg.ssid):
+                        msg.signal = str(ap.signal)
+                        msg.freq = str(ap.freq)
+        msg.header.stamp = rospy.Time.now()
+        self.pub_nm_conn_detail.publish(msg)
+
+    def publish_nm_ssid_list(self):
+        self.ssid_scan_list.header.stamp = rospy.Time.now()
+        self.pub_nm_ssid_list.publish(self.ssid_scan_list)
+
+    def callback_disconnect_wifi(self, msg):
+        if self.disconnect_wifi():
+            rospy.loginfo("<{}> WiFi deactivated.".format(rospy.get_caller_id()))
+        else:
+            rospy.logerr("<{}> WiFi deactivation problem!".format(rospy.get_caller_id()))
+
+    def callback_scan_ap(self, msg):
+        rospy.loginfo("<{}> Ap scan started.".format(rospy.get_caller_id()))
+        result = subprocess.run(["nmcli device wifi list"], shell=True, capture_output=True, text=True)
+        if result:
+            rospy.loginfo("<{}> Ap scan finished.".format(rospy.get_caller_id()))
+            ssids_msg = NmSsidList()
+            try:
+                for dev in NetworkManager.NetworkManager.GetDevices():
+                    if dev.DeviceType == NetworkManager.NM_DEVICE_TYPE_WIFI:
+                        for ap in dev.GetAccessPoints():
+                            ssid = NmSsid()
+                            ssid.ssid = ap.Ssid
+                            ssid.freq = int(ap.Frequency)
+                            ssid.signal = int(ap.Strength)
+                            ssids_msg.ssid_list.append(ssid)
+                        ssids_msg.scan_time = rospy.Time.now()
+                        self.ssid_scan_list = ssids_msg
+            except:
+                rospy.logwarn("<{}> Ap scan error! No wireless interface.".format(rospy.get_caller_id()))
+        else:
+            rospy.logwarn("<{}> Ap scan error!".format(rospy.get_caller_id()))
+
+
+    def callback_conn_activate(self, msg):
+        if msg.data:
+            rospy.loginfo("<{}> Try activate connection {}.".format(rospy.get_caller_id(), msg.data))
+            result = self.activate_connection(msg.data)
+            rospy.loginfo("<{}> Connection activation result: {} {}".format(rospy.get_caller_id(), msg.data, result))
+        else:
+            rospy.logwarn("<{}> Connection name was not specified. Nothing to activate.".format(rospy.get_caller_id()))
+
+
+    def callback_conn_add(self, msg):
+        if msg.ssid and msg.psk_password and (len(msg.psk_password) >= 8):
+            result = self.add_connection(msg.ssid, msg.psk_password)
+            rospy.loginfo("<{}> {}".format(rospy.get_caller_id(), result))
+        else:
+            rospy.logwarn("<{}> Ssid or password was wrong.".format(rospy.get_caller_id()))
+
+    def callback_conn_del(self, msg):
+        if msg.data:
+            result = self.delete_connection(msg.data)
+            rospy.loginfo("<{}> {}".format(rospy.get_caller_id(), result))
+        else:
+            rospy.logwarn("<{}> Connection name was wrong.".format(rospy.get_caller_id()))
+
+
+    def connection_detail(self):
+        condetail = ''
+        ipaddr = ''
+        for conn in NetworkManager.NetworkManager.ActiveConnections:
+            if conn.Connection.GetSettings()['connection']['type'] == '802-11-wireless':
+                settings = conn.Connection.GetSettings()
+
+                for s in list(settings.keys()):
+                    if 'data' in settings[s]:
+                        settings[s + '-data'] = settings[s].pop('data')
+
+                secrets = conn.Connection.GetSecrets()
+                for key in secrets:
+                    settings[key].update(secrets[key])
+
+                devices = ""
+                if conn.Devices:
+                    devices = " (on %s)" % ", ".join([x.Interface for x in conn.Devices])
+                condetail += ("Connection: {}{}\n".format(settings['connection']['id'], devices))
+                for key, val in sorted(settings.items()):
+
+                    if key != 'ipv6':
+                        for name, value in val.items():
+                            if name in ['ssid', 'mode', 'mac-address', 'key-mgmt', 'psk', 'method']:
+                                condetail += ('{}: {}\n'.format(name, value))
+                for dev in conn.Devices:
+                    for addr in dev.Ip4Config.Addresses:
+                        condetail += ("Addr: {}/{} gw: {}\n".format(addr[0], addr[1], addr[2]))
+                        ipaddr = addr[0]
+                    for route in dev.Ip4Config.Routes:
+                        condetail += ("Route: {}/{} gw: {}\n".format(route[0], route[1], route[2]))
+                    for ns in dev.Ip4Config.Nameservers:
+                        condetail += ("DNS: {}\n".format(ns))
+        if ipaddr == '':
+            ipaddr = 'Not connected'
+            condetail = 'Not connected'
+        return condetail, ipaddr
+
+    def disconnect_wifi(self):
+        actconn = NetworkManager.NetworkManager.ActiveConnections
+        for con in actconn:
+            if con.Connection.GetSettings()['connection']['type'] == '802-11-wireless':
+                try:
+                    NetworkManager.NetworkManager.DeactivateConnection(con)
+                    return True
+                except:
+                    return False
+            else:
+                return False
+
+    def list_ssids(self):
+        ssids = ''
+        try:
+            for dev in NetworkManager.NetworkManager.GetDevices():
+                if dev.DeviceType == NetworkManager.NM_DEVICE_TYPE_WIFI:
+                    for ap in dev.GetAccessPoints():
+                        ssids += ('{:20}  {:4} MHz  {:3}%\n'.format(ap.Ssid, ap.Frequency, ap.Strength))
+        except:
+            pass
+        return ssids
+
+
+    def add_connection(self, ssid, password):
+        result = "Connection {} added.".format(ssid)
+        settings = {
+            u'802-11-wireless': {u'ssid': str(ssid),
+                                 u'mode': u'infrastructure',
+                                 u'security': u'802-11-wireless-security'},
+            u'connection': {u'uuid': str(uuid.uuid4()),
+                            u'id': ssid,
+                            u'type': u'802-11-wireless'},
+            u'ipv4': {u'method': u'auto'},
+            u'802-11-wireless-security': {u'key-mgmt': u'wpa-psk',
+                                          u'auth-alg': u'open',
+                                          u'psk': str(password)},
+            u'ipv6': {u'method': u'auto'}}
+        try:
+            NetworkManager.Settings.AddConnection(settings)
+        except:
+            result = "Problem creating connection {}.".format(ssid)
+        return result
+
+    def list_connections(self):
+        connection_list = []
+        for conn in NetworkManager.Settings.ListConnections():
+            settings = conn.GetSettings()['connection']
+            if settings['type'] == '802-11-wireless':
+                connection_list.append('{}'.format(settings['id']))
+        return connection_list
+
+    def activate_connection(self, name):
+        output = 'Connected'
+        # Disconnect current connection
+        return_state = self.disconnect_wifi()
+        if return_state:
+            rospy.loginfo("<{}> WiFi disconnected.".format(rospy.get_caller_id()))
+        else:
+            rospy.loginfo("<{}> WiFi disconnection problem.".format(rospy.get_caller_id()))
+        time.sleep(3)
+        # Find the connection
+        connections = NetworkManager.Settings.ListConnections()
+        connections = dict([(x.GetSettings()['connection']['id'], x) for x in connections])
+        conn = connections[name]
+
+        # Find a suitable device
+        ctype = conn.GetSettings()['connection']['type']
+        dtype = {'802-11-wireless': NetworkManager.NM_DEVICE_TYPE_WIFI}.get(ctype, ctype)
+        devices = NetworkManager.NetworkManager.GetDevices()
+
+        for dev in devices:
+            if dev.DeviceType == dtype and dev.State == NetworkManager.NM_DEVICE_STATE_DISCONNECTED:
+                break
+        else:
+            output = "No suitable {} device.".format(ctype)
+            return output
+
+        try:
+            NetworkManager.NetworkManager.ActivateConnection(conn, dev, "/")
+        except:
+            output = "Network manager failed ({}).".format(name)
+
+        return output
+
+    def delete_connection(self, name):
+        # Find the connection
+        result = "Connection {} deleted.".format(name)
+        try:
+            connections = NetworkManager.Settings.ListConnections()
+            connections = dict([(x.GetSettings()['connection']['id'], x) for x in connections])
+            conn = connections[name]
+            conn.Delete()
+        except:
+            result = "Deleting connection {} error!".format(name)
+        return result
+
+if __name__ == '__main__':
+
+    try:
+        rospy.init_node('network_manager_node')
+        rospy.loginfo("<{}> Initialising nmcli_node...".format(rospy.get_caller_id()))
+        bringup_node = NmcliNode()
+        rate = 1
+        r = rospy.Rate(rate)  # 100Hz
+
+        def signal_handler(signum, frame):
+            rospy.signal_shutdown("end")
+            sys.exit(0)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        rospy.loginfo("<{}> Node nmcli_node initialized".format(rospy.get_caller_id()))
+
+        ap_scan_interval = rate * 180 # Scan ap every 180 sec.
+        ap_scan_counter = 0
+        while not rospy.is_shutdown():
+            # Publish topics
+            bringup_node.publish_nm_conn_list()
+            bringup_node.publish_nm_conn_detail()
+            bringup_node.publish_nm_ssid_list()
+
+            # Scan available access points
+            if (ap_scan_counter == ap_scan_interval):
+                bringup_node.callback_scan_ap(Bool())
+                ap_scan_counter = 0
+            ap_scan_counter += 1
+
+
+            r.sleep()
+
+    except rospy.ROSInterruptException as e:
+        print(e)
+        print("Exception")
+        rospy.loginfo("<{}> nmcli_node error.".format(rospy.get_caller_id()))

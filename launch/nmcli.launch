@@ -1,0 +1,9 @@
+<launch>
+    <arg name="arg_ns" default="nmcli"/>
+    <group ns="$(arg arg_ns)">
+        <node name="network_manager" pkg="vitulus_nmcli" type="network_manager" output="screen">
+
+        </node>
+    </group>
+
+</launch>
