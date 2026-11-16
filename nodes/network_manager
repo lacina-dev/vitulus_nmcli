@@ -14,12 +14,36 @@ DBusGMainLoop(set_as_default=True)
 
 c = NetworkManager.const
 
+# T39 (2026-11-16): the node used to read the whole network state over D-Bus every
+# second (ListConnections + GetSettings of every saved connection, GetSettings 2x and
+# GetSecrets of the active wifi, ...: ~25 calls/s; NetworkManager sent a
+# "Settings.Connection Updated" signal every second in step with it) and it published the
+# wifi password (psk) on /nmcli/conn_detail. Now:
+#  * every second only a cheap look (active connections, their state and IPv4 config
+#    object: ~3 calls); the full read when that changed, after an own action (activate /
+#    add / delete / disconnect / scan) and at least every ~refresh_period seconds;
+#  * no GetSecrets at all - psk stays empty (no consumer read it; a secret has no place
+#    on a topic);
+#  * conn_detail is still published every second (device_state_publisher shows wifi as
+#    DISABLED when its stamp is older than 3 s), from the cached reading; conn_list and
+#    ssid_list are latched and published when their content changes (+ every
+#    refresh_period as a heartbeat).
+REFRESH_PERIOD_S = 15.0
+
+
 class NmcliNode:
 
     def __init__(self):
-        self.pub_nm_conn_list = rospy.Publisher('conn_list', NmConn, queue_size=10)
-        self.pub_nm_conn_detail = rospy.Publisher('conn_detail', NmConnDetail, queue_size=10)
-        self.pub_nm_ssid_list = rospy.Publisher('ssid_list', NmSsidList, queue_size=10)
+        self.pub_nm_conn_list = rospy.Publisher('conn_list', NmConn, queue_size=10, latch=True)
+        self.pub_nm_conn_detail = rospy.Publisher('conn_detail', NmConnDetail, queue_size=10, latch=True)
+        self.pub_nm_ssid_list = rospy.Publisher('ssid_list', NmSsidList, queue_size=10, latch=True)
+        self.refresh_period = float(rospy.get_param('~refresh_period', REFRESH_PERIOD_S))
+        self.dirty = True                 # an own action / start: read everything next turn
+        self.last_sig = None
+        self.last_full = None             # time.time() of the last full read
+        self.detail_cache = None          # the last NmConnDetail read (stamp set on publish)
+        self.conn_list_cache = None
+        self.ssid_sent = None
         self.sub_nm_disconnect_wifi = rospy.Subscriber("disconnect_wifi", Bool, self.callback_disconnect_wifi)
         self.sub_nm_scan_ap = rospy.Subscriber("scan_ap", Bool, self.callback_scan_ap)
         self.sub_nm_conn_activate = rospy.Subscriber("conn_activate", String, self.callback_conn_activate)
@@ -29,27 +53,73 @@ class NmcliNode:
         self.ssid_scan_list = NmSsidList()
         self.callback_scan_ap(Bool())
 
+    # -- T39: change detection --------------------------------------------------
+    @staticmethod
+    def _path(obj):
+        return getattr(obj, 'object_path', None) if obj else None
+
+    def state_signature(self):
+        """A cheap fingerprint of what the topics show: the active connections, their
+        state and their IPv4 config object (NetworkManager makes a new one when the
+        addresses / routes / DNS change)."""
+        sig = []
+        for ac in NetworkManager.NetworkManager.ActiveConnections:
+            try:
+                sig.append((self._path(ac), ac.State, self._path(ac.Ip4Config)))
+            except Exception:
+                sig.append((self._path(ac), None, None))
+        return tuple(sorted(sig, key=lambda x: str(x)))
+
+    def needs_full_read(self, now=None):
+        now = time.time() if now is None else now
+        if self.dirty or self.last_full is None or now - self.last_full >= self.refresh_period:
+            return True
+        try:
+            return self.state_signature() != self.last_sig
+        except Exception:
+            return True
+
+    def step(self, now=None):
+        """One turn of the 1 Hz loop."""
+        now = time.time() if now is None else now
+        heartbeat = self.last_full is None or now - self.last_full >= self.refresh_period
+        if self.needs_full_read(now):
+            self.dirty = False
+            try:
+                self.last_sig = self.state_signature()
+            except Exception:
+                self.last_sig = None
+            self.detail_cache = self.read_conn_detail()
+            conns = self.list_connections()
+            if conns != self.conn_list_cache or heartbeat:
+                self.conn_list_cache = conns
+                self.publish_nm_conn_list()
+            self.last_full = now
+        self.publish_nm_conn_detail()
+        if self.ssid_sent is not self.ssid_scan_list or heartbeat:
+            self.publish_nm_ssid_list()
 
     def publish_nm_conn_list(self):
         msg = NmConn()
-        msg.connections = self.list_connections()
+        msg.connections = list(self.conn_list_cache) if self.conn_list_cache is not None \
+            else self.list_connections()
         msg.header.stamp = rospy.Time.now()
         self.pub_nm_conn_list.publish(msg)
 
     def publish_nm_conn_detail(self):
+        msg = self.detail_cache if self.detail_cache is not None else self.read_conn_detail()
+        msg.header.stamp = rospy.Time.now()
+        self.pub_nm_conn_detail.publish(msg)
+
+    def read_conn_detail(self):
         msg = NmConnDetail()
         msg.status = 'Disconnected'
         for conn in NetworkManager.NetworkManager.ActiveConnections:
-            if conn.Connection.GetSettings()['connection']['type'] == '802-11-wireless':
-                settings = conn.Connection.GetSettings()
-
+            settings = conn.Connection.GetSettings()
+            if settings['connection']['type'] == '802-11-wireless':
                 for s in list(settings.keys()):
                     if 'data' in settings[s]:
                         settings[s + '-data'] = settings[s].pop('data')
-
-                secrets = conn.Connection.GetSecrets()
-                for key in secrets:
-                    settings[key].update(secrets[key])
 
                 devices = ""
                 if conn.Devices:
@@ -67,8 +137,7 @@ class NmcliNode:
                                 msg.mac_address = "{}".format(value)
                             if name == "key-mgmt":
                                 msg.key_mgmt = "{}".format(value)
-                            if name == "psk":
-                                msg.psk = "{}".format(value)
+                            # psk: never read (no GetSecrets) and never published
                             if name == "method":
                                 msg.method = "{}".format(value)
                 for dev in conn.Devices:
@@ -86,15 +155,18 @@ class NmcliNode:
                     if (ap.ssid == msg.ssid):
                         msg.signal = str(ap.signal)
                         msg.freq = str(ap.freq)
-        msg.header.stamp = rospy.Time.now()
-        self.pub_nm_conn_detail.publish(msg)
+        return msg
 
     def publish_nm_ssid_list(self):
-        self.ssid_scan_list.header.stamp = rospy.Time.now()
-        self.pub_nm_ssid_list.publish(self.ssid_scan_list)
+        lst = self.ssid_scan_list
+        lst.header.stamp = rospy.Time.now()
+        self.pub_nm_ssid_list.publish(lst)
+        self.ssid_sent = lst
 
     def callback_disconnect_wifi(self, msg):
-        if self.disconnect_wifi():
+        ok = self.disconnect_wifi()
+        self.dirty = True
+        if ok:
             rospy.loginfo("<{}> WiFi deactivated.".format(rospy.get_caller_id()))
         else:
             rospy.logerr("<{}> WiFi deactivation problem!".format(rospy.get_caller_id()))
@@ -116,6 +188,7 @@ class NmcliNode:
                             ssids_msg.ssid_list.append(ssid)
                         ssids_msg.scan_time = rospy.Time.now()
                         self.ssid_scan_list = ssids_msg
+                self.dirty = True             # conn_detail carries signal / freq of the scan
             except:
                 rospy.logwarn("<{}> Ap scan error! No wireless interface.".format(rospy.get_caller_id()))
         else:
@@ -126,6 +199,7 @@ class NmcliNode:
         if msg.data:
             rospy.loginfo("<{}> Try activate connection {}.".format(rospy.get_caller_id(), msg.data))
             result = self.activate_connection(msg.data)
+            self.dirty = True
             rospy.loginfo("<{}> Connection activation result: {} {}".format(rospy.get_caller_id(), msg.data, result))
         else:
             rospy.logwarn("<{}> Connection name was not specified. Nothing to activate.".format(rospy.get_caller_id()))
@@ -134,6 +208,7 @@ class NmcliNode:
     def callback_conn_add(self, msg):
         if msg.ssid and msg.psk_password and (len(msg.psk_password) >= 8):
             result = self.add_connection(msg.ssid, msg.psk_password)
+            self.dirty = True
             rospy.loginfo("<{}> {}".format(rospy.get_caller_id(), result))
         else:
             rospy.logwarn("<{}> Ssid or password was wrong.".format(rospy.get_caller_id()))
@@ -141,6 +216,7 @@ class NmcliNode:
     def callback_conn_del(self, msg):
         if msg.data:
             result = self.delete_connection(msg.data)
+            self.dirty = True
             rospy.loginfo("<{}> {}".format(rospy.get_caller_id(), result))
         else:
             rospy.logwarn("<{}> Connection name was wrong.".format(rospy.get_caller_id()))
@@ -157,10 +233,6 @@ class NmcliNode:
                     if 'data' in settings[s]:
                         settings[s + '-data'] = settings[s].pop('data')
 
-                secrets = conn.Connection.GetSecrets()
-                for key in secrets:
-                    settings[key].update(secrets[key])
-
                 devices = ""
                 if conn.Devices:
                     devices = " (on %s)" % ", ".join([x.Interface for x in conn.Devices])
@@ -169,7 +241,7 @@ class NmcliNode:
 
                     if key != 'ipv6':
                         for name, value in val.items():
-                            if name in ['ssid', 'mode', 'mac-address', 'key-mgmt', 'psk', 'method']:
+                            if name in ['ssid', 'mode', 'mac-address', 'key-mgmt', 'method']:
                                 condetail += ('{}: {}\n'.format(name, value))
                 for dev in conn.Devices:
                     for addr in dev.Ip4Config.Addresses:
@@ -300,10 +372,13 @@ if __name__ == '__main__':
         ap_scan_interval = rate * 180 # Scan ap every 180 sec.
         ap_scan_counter = 0
         while not rospy.is_shutdown():
-            # Publish topics
-            bringup_node.publish_nm_conn_list()
-            bringup_node.publish_nm_conn_detail()
-            bringup_node.publish_nm_ssid_list()
+            # Publish topics (T39: full D-Bus read only on change / every refresh_period)
+            try:
+                bringup_node.step()
+            except Exception as e:
+                rospy.logwarn_throttle(60, "<{}> NetworkManager read failed: {}".format(
+                    rospy.get_caller_id(), e))
+                bringup_node.dirty = True
 
             # Scan available access points
             if (ap_scan_counter == ap_scan_interval):
