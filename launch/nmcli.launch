@@ -1,7 +1,10 @@
 <launch>
     <arg name="arg_ns" default="nmcli"/>
     <group ns="$(arg arg_ns)">
-        <node name="network_manager" pkg="vitulus_nmcli" type="network_manager" output="log">
+        <!-- respawn (T39): after a crash or an external kill the node used to stay dead and
+             the display showed wifi DISABLED until the whole stack was restarted -->
+        <node name="network_manager" pkg="vitulus_nmcli" type="network_manager" output="log"
+              respawn="true" respawn_delay="30">
 
         </node>
     </group>

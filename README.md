@@ -22,4 +22,8 @@ connection added outside the node (e.g. `nmcli`) within `~refresh_period`.
 The wifi password is never read (no `GetSecrets`) and never published: `conn_detail.psk`
 stays empty.
 
+`launch/nmcli.launch` starts the node with `respawn="true" respawn_delay="30"`: after a crash
+or an external kill roslaunch starts it again in 5 s (before, it stayed dead and the display
+showed wifi DISABLED). The launch file is included once, from `vitulus/launch/vitulus_start.launch`.
+
 Offline test (no ROS, no D-Bus): `python3 test/test_network_manager.py`.

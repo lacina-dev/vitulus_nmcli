@@ -191,6 +191,14 @@ class NodeTest(unittest.TestCase):
             Clock.t = t0 + i
             self.node.step(now=t0 + i)
 
+    def test_launch_respawns_the_node(self):
+        import xml.etree.ElementTree as ET
+        root = ET.parse(os.path.join(os.path.dirname(HERE), "launch", "nmcli.launch")).getroot()
+        nodes = [n for n in root.iter("node") if n.get("type") == "network_manager"]
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].get("respawn"), "true")
+        self.assertEqual(nodes[0].get("respawn_delay"), "30")
+
     def test_latched(self):
         self.assertTrue(self.detail.latch and self.clist.latch and self.ssids.latch)
 
